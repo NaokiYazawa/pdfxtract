@@ -15,6 +15,7 @@ npx pdfxtract <directory> [options]
 | `-o, --output <dir>` | Output directory (preserves subdirectory structure) |
 | `--overwrite` | Overwrite existing TXT files |
 | `-v, --verbose` | Show detailed output |
+| `-V, --version` | Show version number |
 | `-h, --help` | Show help |
 
 ## Examples
