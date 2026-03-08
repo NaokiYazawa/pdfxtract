@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "description": "Recursively convert PDF files to TXT in a directory",
   "type": "module",
-  "bin": "./dist/cli.js",
+  "bin": {
+    "pdfxtract": "dist/cli.js"
+  },
   "engines": {
     "node": ">=20.0.0"
   },
