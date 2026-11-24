@@ -1,6 +1,6 @@
 {
   "name": "pdfxtract",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Recursively convert PDF files to TXT in a directory",
   "type": "module",
   "bin": {
