@@ -22,11 +22,11 @@ const BASELINE_TOLERANCE = 0.3;
 const ADJACENCY_TOLERANCE = 0.5;
 
 /**
- * How many of the most recently started lines a run may join. A run drawn out
- * of order lands right after the line it belongs to, so a short look-back
- * finds it while keeping pages made of thousands of scattered runs linear.
+ * How many of the most recently started lines a run may join. A page rarely
+ * has more lines than this, so a run can reach any line on its page, while a
+ * page made of tens of thousands of scattered runs still stays fast.
  */
-const LOOK_BACK_LINES = 16;
+const LOOK_BACK_LINES = 256;
 
 /**
  * A run moves ahead of an earlier one only if it ends left of where that one
@@ -54,9 +54,22 @@ interface Line {
   right: number;
   /** In reading order. */
   runs: Run[];
+  /**
+   * Where the line goes among the others: the stream position of its run
+   * with the most text. A list marker drawn ahead of its item, or an
+   * emphasized word drawn after its sentence, then follows the bulk of the
+   * line instead of pulling it along.
+   */
+  anchor: number;
+  /** Characters in the run at `anchor`, whitespace aside. */
+  weight: number;
   /** False once a right-to-left run joins: moving runs by x would reverse it. */
   movable: boolean;
-  /** True once a run was placed ahead of one drawn before it. */
+  /**
+   * True once a run was placed out of stream order: ahead of a run drawn
+   * before it, or onto this line after runs went to another. PDF.js spaced
+   * the stream, so such a line needs its spacing rebuilt.
+   */
   reordered: boolean;
   /** Joins no other run: rotated or vertical text keeps its stream order. */
   closed: boolean;
@@ -65,6 +78,10 @@ interface Line {
 
 function fontSize(run: TextRun): number {
   return Math.hypot(run.transform[2], run.transform[3]);
+}
+
+function weigh(str: string): number {
+  return str.replace(/\s/g, "").length;
 }
 
 function onSameBaseline(p: TextRun, q: TextRun): boolean {
@@ -100,7 +117,12 @@ function measureSpaces(runs: readonly TextRun[]): TextRun[] {
   return measured;
 }
 
-function startLine(lines: Line[], run: TextRun, closed: boolean): Line {
+function startLine(
+  lines: Line[],
+  run: TextRun,
+  index: number,
+  closed: boolean,
+): Line {
   const x = run.transform[4];
   const line: Line = {
     baseline: run.transform[5],
@@ -108,6 +130,8 @@ function startLine(lines: Line[], run: TextRun, closed: boolean): Line {
     left: x,
     right: x + run.width,
     runs: [{ x, width: run.width, str: run.str }],
+    anchor: index,
+    weight: weigh(run.str),
     movable: run.dir === "ltr",
     reordered: false,
     closed,
@@ -147,16 +171,29 @@ function insertRun(line: Line, run: Run): void {
   line.runs.splice(at, 0, run);
 }
 
-function placeRun(lines: Line[], run: TextRun): Line {
+function placeRun(
+  lines: Line[],
+  run: TextRun,
+  index: number,
+  previous: Line | undefined,
+): Line {
   const [a, b, , , x] = run.transform;
   // Only runs advancing rightward along a horizontal baseline share lines.
   const horizontal = a > 0 && Math.abs(b) <= Math.abs(a) * 1e-3;
-  if (!horizontal || run.dir === "ttb") return startLine(lines, run, true);
+  if (!horizontal || run.dir === "ttb") {
+    return startLine(lines, run, index, true);
+  }
 
   const line = findLine(lines, run);
-  if (!line) return startLine(lines, run, false);
+  if (!line) return startLine(lines, run, index, false);
 
+  if (line !== previous) line.reordered = true;
   if (run.dir !== "ltr") line.movable = false;
+  const weight = weigh(run.str);
+  if (weight > line.weight) {
+    line.anchor = index;
+    line.weight = weight;
+  }
   line.size = Math.max(line.size, fontSize(run));
   line.left = Math.min(line.left, x);
   line.right = Math.max(line.right, x + run.width);
@@ -168,8 +205,8 @@ function lineText(line: Line): string {
   if (!line.reordered) return line.runs.map((run) => run.str).join("");
 
   // PDF.js fills a gap with one space run spanning all of it, so a run drawn
-  // into that gap later would get a space on one side only. Rebuild the
-  // spacing of a reordered line from where its runs actually sit.
+  // into that gap later would get a space on one side only, and a run drawn
+  // away from its line gets none. Rebuild the spacing from where runs sit.
   let text = "";
   let end = Number.NEGATIVE_INFINITY;
   for (const run of line.runs) {
@@ -185,26 +222,30 @@ function lineText(line: Line): string {
  * Join a page's text runs in reading order.
  *
  * PDF.js reports runs in the order the content stream draws them, which is
- * not always the order they are read: Chrome draws a line's emphasized words
- * in a second pass, so "try nano now" comes out as "try now nano". Runs that
- * sit on one baseline and touch horizontally are gathered into a line, and a
- * run drawn later moves ahead of the runs it sits wholly to the left of.
- * Lines keep the order they first appear in, so columns, tables and anything
- * already in order come out as before.
+ * not always the order they are read. Chrome draws a line's emphasized words
+ * in a second pass, so "try nano now" comes out as "try now nano", and it
+ * draws a list's markers before the items, so "Step 1." lands far from its
+ * text. Runs that sit on one baseline and touch horizontally are gathered
+ * into a line, and a run drawn later moves ahead of the runs it sits wholly to
+ * the left of. Each line goes where its longest run was drawn, so columns,
+ * tables and anything already in order come out as before.
  */
 export function orderPageText(runs: readonly TextRun[]): string {
   const lines: Line[] = [];
   let last: Line | undefined;
 
-  for (const run of measureSpaces(runs)) {
+  measureSpaces(runs).forEach((run, index) => {
     if (run.str === "") {
       // An empty run only marks where PDF.js saw a line end.
-      if (run.hasEOL) (last ?? startLine(lines, run, true)).eol = true;
-      continue;
+      if (run.hasEOL) (last ?? startLine(lines, run, index, true)).eol = true;
+      return;
     }
-    last = placeRun(lines, run);
+    last = placeRun(lines, run, index, last);
     if (run.hasEOL) last.eol = true;
-  }
+  });
 
-  return lines.map((line) => lineText(line) + (line.eol ? "\n" : "")).join("");
+  return lines
+    .sort((p, q) => p.anchor - q.anchor)
+    .map((line) => lineText(line) + (line.eol ? "\n" : ""))
+    .join("");
 }
